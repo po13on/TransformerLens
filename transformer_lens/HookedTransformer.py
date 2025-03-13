@@ -1284,9 +1284,9 @@ class HookedTransformer(HookedRootModule):
             assert not (
                 load_in_4bit and (version.parse(torch.__version__) < version.parse("2.1.1"))
             ), "Quantization is only supported for torch versions >= 2.1.1"
-            assert not (
-                load_in_4bit and ("llama" not in model_name.lower())
-            ), "Quantization is only supported for Llama models"
+            # assert not (
+            #     load_in_4bit and ("llama" not in model_name.lower())
+            # ), "Quantization is only supported for Llama models"
             if load_in_4bit:
                 assert (
                     qc.get("quant_method", "") == "bitsandbytes"
@@ -1359,7 +1359,6 @@ class HookedTransformer(HookedRootModule):
         state_dict = loading.get_pretrained_state_dict(
             official_model_name, cfg, hf_model, dtype=dtype, **from_pretrained_kwargs
         )
-
         # Create the HookedTransformer object
         model = cls(
             cfg,

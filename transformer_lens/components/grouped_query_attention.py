@@ -8,6 +8,11 @@ from transformer_lens.components import AbstractAttention
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear
 
+from transformers.utils import is_bitsandbytes_available
+if is_bitsandbytes_available():
+    import bitsandbytes as bnb
+    from bitsandbytes.nn.modules import Params4bit
+
 
 class GroupedQueryAttention(AbstractAttention):
     def __init__(
@@ -31,22 +36,28 @@ class GroupedQueryAttention(AbstractAttention):
         assert cfg.n_key_value_heads is not None
         super().__init__(cfg, attn_type, layer_id)
         self.repeat_kv_heads = cfg.n_heads // cfg.n_key_value_heads
-        self._W_K = nn.Parameter(
-            torch.empty(
-                cfg.n_key_value_heads,
-                self.cfg.d_model,
-                self.cfg.d_head,
-                dtype=cfg.dtype,
+        if self.cfg.load_in_4bit:
+            # 4-bit quantization convention
+            nq = int((self.cfg.d_model * self.cfg.d_head * self.cfg.n_key_value_heads) / 2)
+            self._W_K = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
+            self._W_V = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
+        else:
+            self._W_K = nn.Parameter(
+                torch.empty(
+                    cfg.n_key_value_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=cfg.dtype,
+                )
             )
-        )
-        self._W_V = nn.Parameter(
-            torch.empty(
-                cfg.n_key_value_heads,
-                self.cfg.d_model,
-                self.cfg.d_head,
-                dtype=cfg.dtype,
+            self._W_V = nn.Parameter(
+                torch.empty(
+                    cfg.n_key_value_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=cfg.dtype,
+                )
             )
-        )
         self._b_K = nn.Parameter(
             torch.zeros(cfg.n_key_value_heads, self.cfg.d_head, dtype=cfg.dtype)
         )
@@ -123,20 +134,66 @@ class GroupedQueryAttention(AbstractAttention):
             else simple_attn_linear
         )
 
-        q = self.hook_q(
-            attn_fn(query_input, self.W_Q, self.b_Q)
-        )  # [batch, pos, head_index, d_head]
+        if self.cfg.load_in_4bit:
+            q = self.hook_q(
+                # call bitsandbytes method to dequantize and multiply
+                bnb.matmul_4bit(
+                    query_input,
+                    self.W_Q.t(),
+                    bias=None,
+                    quant_state=self.W_Q.quant_state,
+                ).reshape(
+                    query_input.shape[0],
+                    query_input.shape[1],
+                    self.cfg.n_heads,
+                    self.cfg.d_head,
+                )
+                + self.b_Q
+            )
+        else:
+            q = self.hook_q(
+                attn_fn(query_input, self.W_Q, self.b_Q)
+            )  # [batch, pos, head_index, d_head]
 
-        k = self.hook_k(
-            attn_fn(key_input, self.W_K, self.b_K)
-            if self.cfg.ungroup_grouped_query_attention
-            else attn_fn(key_input, self._W_K, self._b_K)
-        )  # [batch, pos, head_index, d_head]
-        v = self.hook_v(
-            attn_fn(value_input, self.W_V, self.b_V)
-            if self.cfg.ungroup_grouped_query_attention
-            else attn_fn(value_input, self._W_V, self._b_V)
-        )  # [batch, pos, head_index, d_head]
+        if self.cfg.load_in_4bit:
+            if not isinstance(self._W_K, Params4bit):
+                raise ValueError("W_K must be a Params4bit object if load_in_4bit is True")
+            k = bnb.matmul_4bit(
+                    key_input, self._W_K.t(), bias=None, quant_state=self._W_K.quant_state
+                ).reshape(
+                    key_input.shape[0],
+                    key_input.shape[1],
+                    self.cfg.n_key_value_heads,
+                    self.cfg.d_head,
+                ) + self._b_K
+        else:
+            k = self.hook_k(
+                attn_fn(key_input, self.W_K, self.b_K)
+                if self.cfg.ungroup_grouped_query_attention
+                else attn_fn(key_input, self._W_K, self._b_K)
+            )  # [batch, pos, head_index, d_head]
+        
+        if self.cfg.load_in_4bit:
+            if not isinstance(self._W_V, Params4bit):
+                raise ValueError("W_V must be a Params4bit object if load_in_4bit is True")
+            v = bnb.matmul_4bit(
+                    value_input,
+                    self._W_V.t(),
+                    bias=None,
+                    quant_state=self._W_V.quant_state,
+                ).reshape(
+                    value_input.shape[0],
+                    value_input.shape[1],
+                    self.cfg.n_key_value_heads,
+                    self.cfg.d_head,
+                ) + self._b_V
+        else:
+            v = self.hook_v(
+                attn_fn(value_input, self.W_V, self.b_V)
+                if self.cfg.ungroup_grouped_query_attention
+                else attn_fn(value_input, self._W_V, self._b_V)
+            )  # [batch, pos, head_index, d_head]
+
         return q, k, v
 
     def calculate_attention_scores(
@@ -155,7 +212,9 @@ class GroupedQueryAttention(AbstractAttention):
             Float[torch.Tensor, "batch head_index query_pos key_pos"]: The attention scores.
         """
         if not self.cfg.ungroup_grouped_query_attention:
-            k = torch.repeat_interleave(k, dim=2, repeats=self.repeat_kv_heads)
+            k = self.hook_k(torch.repeat_interleave(k, dim=2, repeats=self.repeat_kv_heads))
+            if self.cfg.dtype not in [torch.float32, torch.float64]:
+                k = k.to(torch.float32)
         return super().calculate_attention_scores(q, k)
 
     def calculate_z_scores(
@@ -174,5 +233,5 @@ class GroupedQueryAttention(AbstractAttention):
             Float[torch.Tensor, "batch head_index query_pos key_pos"]: The z scores.
         """
         if not self.cfg.ungroup_grouped_query_attention:
-            v = torch.repeat_interleave(v, dim=2, repeats=self.repeat_kv_heads)
+            v = self.hook_v(torch.repeat_interleave(v, dim=2, repeats=self.repeat_kv_heads))
         return super().calculate_z_scores(v, pattern)

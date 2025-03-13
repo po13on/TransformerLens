@@ -10,6 +10,8 @@ from better_abc import abstract_attribute
 from jaxtyping import Float, Int
 from transformers.utils import is_bitsandbytes_available
 
+import bitsandbytes.functional as bnbF
+
 from transformer_lens.FactoredMatrix import FactoredMatrix
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
@@ -212,7 +214,6 @@ class AbstractAttention(ABC, nn.Module):
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             # If using 16 bits, increase the precision to avoid numerical instabilities
             q = q.to(torch.float32)
-            k = k.to(torch.float32)
 
         attn_scores = self.calculate_attention_scores(
             q, k
@@ -294,14 +295,24 @@ class AbstractAttention(ABC, nn.Module):
             # Explicitly calculate the attention result so it can be accessed by a hook
             # This is off by default because it can easily eat through your GPU memory.
             if self.cfg.load_in_4bit:
+                # result = self.hook_result(
+                #     bnb.matmul_4bit(
+                #         z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                #         self.W_O.t(),
+                #         bias=None,
+                #         quant_state=self.W_O.quant_state,
+                #     )
+                # )
+
+                w = bnbF.dequantize_4bit(self.W_O.t(), self.W_O.quant_state).to(z.dtype)
+                w = einops.rearrange(w, '(head_index d_head) d_model -> head_index d_head d_model', head_index = self.cfg.n_heads)
                 result = self.hook_result(
-                    bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
-                        self.W_O.t(),
-                        bias=None,
-                        quant_state=self.W_O.quant_state,
+                    einops.einsum(
+                        z,
+                        w,
+                        "... head_index d_head, head_index d_head d_model -> ... head_index d_model",
                     )
-                )
+                ) # [batch, pos, head_index, d_model] # hsc
             else:
                 # Add singleton dimensions to make shapes compatible for broadcasting:
                 w = einops.rearrange(
@@ -319,7 +330,7 @@ class AbstractAttention(ABC, nn.Module):
             out = (
                 einops.reduce(result, "batch position index model->batch position model", "sum")
                 + self.b_O
-            )  # [batch, pos, d_model]
+            ) if result.ndim == 4 else result + self.b_O  # [batch, pos, d_model] # XD
         return out
 
     def calculate_qkv_matrices(
